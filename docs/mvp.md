@@ -70,7 +70,7 @@ The following features are not included in the first MVP:
 ## Expected CLI Commands
 
 ```bash
-hotspot start
-hotspot stop
-hotspot restart
-hotspot status
+autohotspot start
+autohotspot stop
+autohotspot restart
+autohotspot status
