@@ -6,7 +6,7 @@ The MVP is a Bash-based Linux CLI tool that creates a local Wi-Fi hotspot from a
 
 The tool verifies whether the wireless card supports AP mode and whether it can operate as a hotspot while the host machine is connected to an upstream Wi-Fi network.
 
-The hotspot provides a local network for connected devices, allows those devices to communicate with the host machine, and optionally shares the host's internet connection through NAT when an upstream connection is available.
+The hotspot provides a local network for connected devices, allows those devices to access services exposed by the host machine, and optionally shares the host's internet connection through NAT when an upstream connection is available.
 
 ## Goal
 
@@ -51,6 +51,7 @@ The MVP includes the following features:
 - Work as a local-only hotspot when no upstream connection is available.
 - Provide commands to start, stop, restart, and check the hotspot status.
 - Clean up hotspot-related processes, virtual interfaces, IP addresses, and firewall rules before starting or stopping.
+- Provide a diagnostic command to check system dependencies, wireless capabilities, permissions, and current network state.
 
 ## Out of Scope
 
