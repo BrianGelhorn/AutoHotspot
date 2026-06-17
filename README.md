@@ -112,6 +112,18 @@ Example local-only hotspot:
 sudo autohotspot start --interface wlan0
 ```
 
+Example with custom hotspot name and password:
+
+```bash
+sudo autohotspot start --interface wlan0 --ssid AutoHotspot --password "change-this-password"
+```
+
+The `--ssid` argument sets the Wi-Fi network name exposed by the hotspot.
+The `--password` argument sets the WPA/WPA2 password used by connected devices.
+The password must be at least 8 characters long.
+
+`--passphrase` may also be supported as an alias for `--password`.
+
 Example with internet sharing from Ethernet:
 
 ```bash
