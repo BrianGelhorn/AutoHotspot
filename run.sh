@@ -4,11 +4,14 @@ set -euo pipefail
 REAL_IFACE="wlp0s20f3"
 AP_IFACE="ap0"
 
-PUBLIC_WIFI="FRD_Invitados"
+PUBLIC_WIFI=""
 PUBLIC_WIFI_PASS=""
 
 HOTSPOT_SSID="AutoHotspot"
-HOTSPOT_PASS="TestPassword"
+HOTSPOT_PASS="AutoHotspot123"
+HOTSPOT_SSID_PROVIDED=0
+HOTSPOT_PASS_PROVIDED=0
+SHARE_INTERNET=0
 
 AP_IP="192.168.50.1"
 AP_CIDR="192.168.50.1/24"
@@ -35,6 +38,113 @@ require_privileges() {
     fi
 }
 
+usage() {
+    echo "Usage: sudo $0 [--ssid <hotspot-name> --password <hotspot-password>] [--wifi-ssid <wifi-name> --wifi-password <wifi-password>]"
+}
+
+parse_args() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --ssid)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "[ERROR] Missing value for --ssid."
+                    usage
+                    exit 1
+                fi
+
+                HOTSPOT_SSID="$2"
+                HOTSPOT_SSID_PROVIDED=1
+                shift 2
+                ;;
+            --password)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "[ERROR] Missing value for --password."
+                    usage
+                    exit 1
+                fi
+
+                HOTSPOT_PASS="$2"
+                HOTSPOT_PASS_PROVIDED=1
+                shift 2
+                ;;
+            --wifi-ssid)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "[ERROR] Missing value for --wifi-ssid."
+                    usage
+                    exit 1
+                fi
+
+                PUBLIC_WIFI="$2"
+                shift 2
+                ;;
+            --wifi-password)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "[ERROR] Missing value for --wifi-password."
+                    usage
+                    exit 1
+                fi
+
+                PUBLIC_WIFI_PASS="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "[ERROR] Unknown argument: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    if [[ -n "$PUBLIC_WIFI_PASS" && -z "$PUBLIC_WIFI" ]]; then
+        echo "[ERROR] --wifi-password requires --wifi-ssid."
+        usage
+        exit 1
+    fi
+}
+
+print_hotspot_defaults_notice() {
+    if (( ! HOTSPOT_SSID_PROVIDED && ! HOTSPOT_PASS_PROVIDED )); then
+        echo "[WARN] No hotspot --ssid or --password was provided."
+        echo "[WARN] Using default hotspot credentials: SSID '$HOTSPOT_SSID', password '$HOTSPOT_PASS'."
+    elif (( ! HOTSPOT_SSID_PROVIDED )); then
+        echo "[WARN] No hotspot --ssid was provided. Using default SSID '$HOTSPOT_SSID'."
+    elif (( ! HOTSPOT_PASS_PROVIDED )); then
+        echo "[WARN] No hotspot --password was provided. Using default password '$HOTSPOT_PASS'."
+    fi
+}
+
+current_wifi_connection() {
+    nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | \
+        awk -F: '$2 == "802-11-wireless" { print $1; exit }' || true
+}
+
+configure_networks() {
+    local active_connection
+
+    if [[ -n "$PUBLIC_WIFI" ]]; then
+        SHARE_INTERNET=1
+        return
+    fi
+
+    active_connection="$(current_wifi_connection)"
+
+    if [[ -n "$active_connection" ]]; then
+        PUBLIC_WIFI="$active_connection"
+        SHARE_INTERNET=1
+        return
+    fi
+
+    echo "[WARN] No active Wi-Fi network was found."
+    echo "[WARN] The hotspot will be created without sharing an upstream network."
+    echo "[WARN] To use a specific upstream Wi-Fi, pass --wifi-ssid and --wifi-password or connect to it before running this script."
+}
+
 package_for_dependency() {
     local dependency="$1"
     local package_manager="$2"
@@ -54,6 +164,12 @@ package_for_dependency() {
             ;;
         pacman:nmcli)
             echo "networkmanager"
+            ;;
+        apt-get:awk)
+            echo "mawk"
+            ;;
+        dnf:awk|pacman:awk)
+            echo "gawk"
             ;;
         apt-get:pkill|apt-get:sysctl)
             echo "procps"
@@ -229,6 +345,7 @@ require_dependencies() {
         iptables
         iw
         nmcli
+        awk
         pkill
         rfkill
         rm
@@ -260,12 +377,16 @@ require_dependencies() {
     fi
 }
 
+parse_args "$@"
+validate_args
 require_linux
 require_privileges "$@"
+print_hotspot_defaults_notice
 require_dependencies
+configure_networks
 
 if (( ${#HOTSPOT_PASS} < 8 )); then
-    echo "[ERROR] The hotspot password must be at least 8 characters long."
+    echo "[ERROR] The hotspot password must be at least 8 characters long. Use --password."
     exit 1
 fi
 
@@ -278,15 +399,18 @@ iptables -D FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || tru
 iptables -D FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iw dev "$AP_IFACE" del 2>/dev/null || true
 
-echo "[*] Connecting $REAL_IFACE to $PUBLIC_WIFI..."
 rfkill unblock wifi
 nmcli radio wifi on
 
-if [[ -n "$PUBLIC_WIFI_PASS" ]]; then
-    nmcli device wifi connect "$PUBLIC_WIFI" password "$PUBLIC_WIFI_PASS" ifname "$REAL_IFACE"
-else
-    nmcli connection up "$PUBLIC_WIFI" ifname "$REAL_IFACE" 2>/dev/null || \
-        nmcli device wifi connect "$PUBLIC_WIFI" ifname "$REAL_IFACE"
+if (( SHARE_INTERNET )); then
+    echo "[*] Using Wi-Fi upstream: $PUBLIC_WIFI"
+
+    if [[ -n "$PUBLIC_WIFI_PASS" ]]; then
+        nmcli device wifi connect "$PUBLIC_WIFI" password "$PUBLIC_WIFI_PASS" ifname "$REAL_IFACE"
+    else
+        nmcli connection up "$PUBLIC_WIFI" ifname "$REAL_IFACE" 2>/dev/null || \
+            nmcli device wifi connect "$PUBLIC_WIFI" ifname "$REAL_IFACE"
+    fi
 fi
 
 echo "[*] Creating virtual interface $AP_IFACE..."
@@ -317,11 +441,15 @@ dhcp-option=6,1.1.1.1,8.8.8.8
 pid-file=$DNSMASQ_PID
 EOF
 
-echo "[*] Enabling NAT..."
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-iptables -t nat -A POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
-iptables -A FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+if (( SHARE_INTERNET )); then
+    echo "[*] Enabling NAT..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    iptables -t nat -A POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
+    iptables -A FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
+    iptables -A FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+else
+    echo "[*] Skipping NAT because no upstream Wi-Fi network is active."
+fi
 
 echo "[*] Starting services..."
 hostapd -B -P "$HOSTAPD_PID" "$HOSTAPD_CONF"
@@ -333,3 +461,8 @@ echo "SSID: $HOTSPOT_SSID"
 echo "PASS: $HOTSPOT_PASS"
 echo "Gateway: $AP_IP"
 echo "DHCP: $DHCP_START - $DHCP_END"
+if (( SHARE_INTERNET )); then
+    echo "Upstream: $PUBLIC_WIFI"
+else
+    echo "Upstream: none"
+fi
