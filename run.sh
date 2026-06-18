@@ -12,6 +12,7 @@ HOTSPOT_PASS="AutoHotspot123"
 HOTSPOT_SSID_PROVIDED=0
 HOTSPOT_PASS_PROVIDED=0
 SHARE_INTERNET=0
+STATUS_VERBOSE=0
 
 AP_IP="192.168.50.1"
 AP_CIDR="192.168.50.1/24"
@@ -22,6 +23,9 @@ HOSTAPD_CONF="/tmp/autohotspot-hostapd.conf"
 DNSMASQ_CONF="/tmp/autohotspot-dnsmasq.conf"
 HOSTAPD_PID="/tmp/autohotspot-hostapd.pid"
 DNSMASQ_PID="/tmp/autohotspot-dnsmasq.pid"
+DNSMASQ_LEASES="/tmp/autohotspot-dnsmasq.leases"
+IP_FORWARD_STATE="/tmp/autohotspot-ip-forward.state"
+COMMAND="start"
 
 require_linux() {
     if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
@@ -32,19 +36,30 @@ require_linux() {
 
 require_privileges() {
     if [[ "$EUID" -ne 0 ]]; then
-        echo "[*] This script requires sudo privileges."
-        sudo -v
+        if ! sudo -n true 2>/dev/null; then
+            echo "[*] AutoHotspot needs administrator permissions to configure Wi-Fi interfaces, iptables, DHCP, and hostapd."
+            sudo -v
+        fi
+
         exec sudo -E bash "$0" "$@"
     fi
 }
 
 usage() {
-    echo "Usage: sudo $0 [--ssid <hotspot-name> --password <hotspot-password>] [--wifi-ssid <wifi-name> --wifi-password <wifi-password>]"
+    echo "Usage: sudo $0 [start|stop|status] [--verbose] [--ssid <hotspot-name> --password <hotspot-password>] [--wifi-ssid <wifi-name> --wifi-password <wifi-password>]"
 }
 
 parse_args() {
     while (( $# > 0 )); do
         case "$1" in
+            start|stop|status)
+                COMMAND="$1"
+                shift
+                ;;
+            --verbose)
+                STATUS_VERBOSE=1
+                shift
+                ;;
             --ssid)
                 if [[ $# -lt 2 || -z "$2" ]]; then
                     echo "[ERROR] Missing value for --ssid."
@@ -106,9 +121,19 @@ validate_args() {
         usage
         exit 1
     fi
+
+    if (( STATUS_VERBOSE )) && [[ "$COMMAND" != "status" ]]; then
+        echo "[ERROR] --verbose is only supported with status."
+        usage
+        exit 1
+    fi
 }
 
 print_hotspot_defaults_notice() {
+    if [[ "$COMMAND" != "start" ]]; then
+        return
+    fi
+
     if (( ! HOTSPOT_SSID_PROVIDED && ! HOTSPOT_PASS_PROVIDED )); then
         echo "[WARN] No hotspot --ssid or --password was provided."
         echo "[WARN] Using default hotspot credentials: SSID '$HOTSPOT_SSID', password '$HOTSPOT_PASS'."
@@ -143,6 +168,219 @@ configure_networks() {
     echo "[WARN] No active Wi-Fi network was found."
     echo "[WARN] The hotspot will be created without sharing an upstream network."
     echo "[WARN] To use a specific upstream Wi-Fi, pass --wifi-ssid and --wifi-password or connect to it before running this script."
+}
+
+unblock_wifi() {
+    if [[ ! -e /dev/rfkill ]]; then
+        echo "[WARN] /dev/rfkill is not available; skipping rfkill unblock."
+        echo "[WARN] If Wi-Fi is blocked, expose /dev/rfkill to the container or unblock Wi-Fi on the host."
+        return
+    fi
+
+    if ! rfkill unblock wifi; then
+        echo "[WARN] Could not unblock Wi-Fi with rfkill; continuing anyway."
+        echo "[WARN] If Wi-Fi stays disabled, run 'rfkill unblock wifi' on the host and try again."
+    fi
+}
+
+save_ip_forward_state() {
+    if [[ ! -f "$IP_FORWARD_STATE" ]]; then
+        sysctl -n net.ipv4.ip_forward >"$IP_FORWARD_STATE" 2>/dev/null || true
+    fi
+}
+
+restore_ip_forward_state() {
+    if [[ -f "$IP_FORWARD_STATE" ]]; then
+        local previous_state
+        previous_state="$(<"$IP_FORWARD_STATE")"
+
+        if [[ "$previous_state" == "0" || "$previous_state" == "1" ]]; then
+            sysctl -w "net.ipv4.ip_forward=$previous_state" >/dev/null 2>&1 || true
+        fi
+
+        rm -f "$IP_FORWARD_STATE"
+    fi
+}
+
+cleanup_hotspot() {
+    echo "[*] Cleaning AutoHotspot resources..."
+    pkill -F "$HOSTAPD_PID" 2>/dev/null || true
+    pkill -F "$DNSMASQ_PID" 2>/dev/null || true
+    rm -f "$HOSTAPD_PID" "$DNSMASQ_PID" "$HOSTAPD_CONF" "$DNSMASQ_CONF" "$DNSMASQ_LEASES"
+    iptables -t nat -D POSTROUTING -o "$REAL_IFACE" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iw dev "$AP_IFACE" del 2>/dev/null || true
+    restore_ip_forward_state
+}
+
+process_running_from_pidfile() {
+    local pidfile="$1"
+    local pid
+
+    [[ -f "$pidfile" ]] || return 1
+    pid="$(<"$pidfile")"
+    [[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]]
+}
+
+config_value() {
+    local file="$1"
+    local key="$2"
+    local line
+
+    [[ -f "$file" ]] || return 1
+
+    while IFS= read -r line; do
+        case "$line" in
+            "$key="*)
+                echo "${line#*=}"
+                return 0
+                ;;
+        esac
+    done <"$file"
+
+    return 1
+}
+
+iptables_has_rule() {
+    if [[ "$EUID" -eq 0 ]]; then
+        iptables "$@" >/dev/null 2>&1
+    elif sudo -n true 2>/dev/null; then
+        sudo iptables "$@" >/dev/null 2>&1
+    else
+        return 2
+    fi
+}
+
+print_rule_status() {
+    local label="$1"
+    shift
+
+    if iptables_has_rule "$@"; then
+        echo "$label: present"
+    else
+        case "$?" in
+            2)
+                echo "$label: unknown (administrator permissions required)"
+                ;;
+            *)
+                echo "$label: missing"
+                ;;
+        esac
+    fi
+}
+
+connected_client_count() {
+    local station_count=""
+
+    station_count="$(iw dev "$AP_IFACE" station dump 2>/dev/null | awk '/^Station / { count++ } END { print count + 0 }')" || station_count=""
+
+    if [[ -n "$station_count" ]]; then
+        echo "$station_count"
+        return
+    fi
+
+    if [[ -f "$DNSMASQ_LEASES" ]]; then
+        awk 'NF > 0 { count++ } END { print count + 0 }' "$DNSMASQ_LEASES"
+        return
+    fi
+
+    echo 0
+}
+
+print_status() {
+    local hostapd_status="stopped"
+    local dnsmasq_status="stopped"
+    local ap_status="missing"
+    local ap_ip_status="missing"
+    local overall_status="stopped"
+    local ssid="unknown"
+    local ip_forward="unknown"
+    local upstream="none"
+    local internet_sharing="no"
+    local connected_clients="0"
+
+    if process_running_from_pidfile "$HOSTAPD_PID"; then
+        hostapd_status="running"
+    fi
+
+    if process_running_from_pidfile "$DNSMASQ_PID"; then
+        dnsmasq_status="running"
+    fi
+
+    if iw dev "$AP_IFACE" info >/dev/null 2>&1; then
+        ap_status="present"
+    fi
+
+    if ip addr show dev "$AP_IFACE" 2>/dev/null | awk -v cidr="$AP_CIDR" '$1 == "inet" && $2 == cidr { found = 1 } END { exit !found }'; then
+        ap_ip_status="present"
+    fi
+
+    ssid="$(config_value "$HOSTAPD_CONF" ssid || echo "unknown")"
+    ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "unknown")"
+    upstream="$(current_wifi_connection)"
+    connected_clients="$(connected_client_count)"
+
+    if [[ -z "$upstream" ]]; then
+        upstream="none"
+    fi
+
+    if [[ "$hostapd_status" == "running" && "$dnsmasq_status" == "running" && "$ap_status" == "present" ]]; then
+        overall_status="running"
+    elif [[ "$hostapd_status" == "running" || "$dnsmasq_status" == "running" || "$ap_status" == "present" ]]; then
+        overall_status="partial"
+    fi
+
+    if [[ "$overall_status" == "stopped" ]]; then
+        internet_sharing="no"
+    elif iptables_has_rule -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE; then
+        if [[ "$ip_forward" == "1" && "$upstream" != "none" ]]; then
+            internet_sharing="yes, from $upstream"
+        else
+            internet_sharing="partial"
+        fi
+    else
+        case "$?" in
+            2)
+                if [[ "$upstream" != "none" ]]; then
+                    internet_sharing="unknown, upstream is $upstream (administrator permissions required to check NAT)"
+                else
+                    internet_sharing="unknown (administrator permissions required)"
+                fi
+                ;;
+            *)
+                internet_sharing="no"
+                ;;
+        esac
+    fi
+
+    echo "AutoHotspot status"
+    echo "State: $overall_status"
+    echo "SSID: $ssid"
+    echo "AP interface ($AP_IFACE): $ap_status"
+    echo "Gateway: $AP_IP"
+    echo "Internet sharing: $internet_sharing"
+    echo "Connected devices: $connected_clients"
+
+    if (( ! STATUS_VERBOSE )); then
+        return
+    fi
+
+    echo "hostapd: $hostapd_status"
+    echo "dnsmasq: $dnsmasq_status"
+    echo "AP address ($AP_CIDR): $ap_ip_status"
+    echo "ip_forward: $ip_forward"
+    echo "Upstream Wi-Fi: $upstream"
+    echo "DHCP leases: $DNSMASQ_LEASES"
+    print_rule_status "NAT rule" -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
+    print_rule_status "Forward AP to upstream" -C FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
+    print_rule_status "Forward upstream to AP" -C FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    if [[ -f "$IP_FORWARD_STATE" ]]; then
+        echo "Saved ip_forward state: $(<"$IP_FORWARD_STATE")"
+    else
+        echo "Saved ip_forward state: none"
+    fi
 }
 
 package_for_dependency() {
@@ -380,9 +618,22 @@ require_dependencies() {
 parse_args "$@"
 validate_args
 require_linux
+
+if [[ "$COMMAND" == "status" ]]; then
+    print_status
+    exit 0
+fi
+
 require_privileges "$@"
 print_hotspot_defaults_notice
 require_dependencies
+
+if [[ "$COMMAND" == "stop" ]]; then
+    cleanup_hotspot
+    echo "[OK] AutoHotspot stopped."
+    exit 0
+fi
+
 configure_networks
 
 if (( ${#HOTSPOT_PASS} < 8 )); then
@@ -390,16 +641,9 @@ if (( ${#HOTSPOT_PASS} < 8 )); then
     exit 1
 fi
 
-echo "[*] Cleaning previous run..."
-pkill -F "$HOSTAPD_PID" 2>/dev/null || true
-pkill -F "$DNSMASQ_PID" 2>/dev/null || true
-rm -f "$HOSTAPD_PID" "$DNSMASQ_PID"
-iptables -t nat -D POSTROUTING -o "$REAL_IFACE" -j MASQUERADE 2>/dev/null || true
-iptables -D FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iw dev "$AP_IFACE" del 2>/dev/null || true
+cleanup_hotspot
 
-rfkill unblock wifi
+unblock_wifi
 nmcli radio wifi on
 
 if (( SHARE_INTERNET )); then
@@ -439,10 +683,12 @@ dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,12h
 dhcp-option=3,$AP_IP
 dhcp-option=6,1.1.1.1,8.8.8.8
 pid-file=$DNSMASQ_PID
+dhcp-leasefile=$DNSMASQ_LEASES
 EOF
 
 if (( SHARE_INTERNET )); then
     echo "[*] Enabling NAT..."
+    save_ip_forward_state
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     iptables -t nat -A POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
     iptables -A FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
