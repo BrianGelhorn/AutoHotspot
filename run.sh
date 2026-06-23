@@ -9,6 +9,7 @@ PUBLIC_WIFI_PASS=""
 
 HOTSPOT_SSID="AutoHotspot"
 HOTSPOT_PASS="AutoHotspot123"
+HOTSPOT_CHANNEL="1"
 HOTSPOT_SSID_PROVIDED=0
 HOTSPOT_PASS_PROVIDED=0
 SHARE_INTERNET=0
@@ -157,6 +158,43 @@ print_hotspot_defaults_notice() {
 current_wifi_connection() {
     nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | \
         awk -F: '$2 == "802-11-wireless" { print $1; exit }' || true
+}
+
+current_wifi_channel() {
+    local iface="$1"
+    local channel
+
+    if [[ -z "$iface" ]]; then
+        return 1
+    fi
+
+    channel="$(iw dev "$iface" link 2>/dev/null | awk '/channel:/ { print $2; exit }')"
+    if [[ -n "$channel" ]]; then
+        echo "$channel"
+        return 0
+    fi
+
+    channel="$(iw dev "$iface" info 2>/dev/null | awk '/channel/ { print $2; exit }')"
+    if [[ -n "$channel" ]]; then
+        echo "$channel"
+        return 0
+    fi
+
+    channel="$(nmcli -t -f DEVICE,CHAN device status 2>/dev/null | awk -F: -v dev="$iface" '$1 == dev && $2 != "--" { print $2; exit }')"
+    if [[ -n "$channel" ]]; then
+        echo "$channel"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_hotspot_channel() {
+    local channel
+
+    channel="$(current_wifi_channel "$REAL_IFACE")" || return 1
+    HOTSPOT_CHANNEL="$channel"
+    echo "[*] Detected current Wi-Fi channel: $HOTSPOT_CHANNEL"
 }
 
 configure_networks() {
@@ -732,6 +770,10 @@ if (( SHARE_INTERNET )); then
     fi
 fi
 
+if ! detect_hotspot_channel; then
+    echo "[WARN] No current Wi-Fi channel detected; using default channel $HOTSPOT_CHANNEL."
+fi
+
 echo "[*] Creating virtual interface $AP_IFACE..."
 iw dev "$REAL_IFACE" interface add "$AP_IFACE" type __ap
 nmcli device set "$AP_IFACE" managed no 2>/dev/null || true
@@ -743,7 +785,7 @@ interface=$AP_IFACE
 driver=nl80211
 ssid=$HOTSPOT_SSID
 hw_mode=g
-channel=1
+channel=$HOTSPOT_CHANNEL
 auth_algs=1
 wpa=2
 wpa_passphrase=$HOTSPOT_PASS
