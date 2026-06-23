@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REAL_IFACE="wlp0s20f3"
+REAL_IFACE=""
 AP_IFACE="ap0"
 
 PUBLIC_WIFI=""
@@ -46,7 +46,7 @@ require_privileges() {
 }
 
 usage() {
-    echo "Usage: sudo $0 [start|stop|status] [--verbose] [--ssid <hotspot-name> --password <hotspot-password>] [--wifi-ssid <wifi-name> --wifi-password <wifi-password>]"
+    echo "Usage: sudo $0 [start|stop|status] [--interface <wifi-interface>] [--verbose] [--ssid <hotspot-name> --password <hotspot-password>] [--wifi-ssid <wifi-name> --wifi-password <wifi-password>]"
 }
 
 parse_args() {
@@ -59,6 +59,16 @@ parse_args() {
             --verbose)
                 STATUS_VERBOSE=1
                 shift
+                ;;
+            --interface)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "[ERROR] Missing value for --interface."
+                    usage
+                    exit 1
+                fi
+
+                REAL_IFACE="$2"
+                shift 2
                 ;;
             --ssid)
                 if [[ $# -lt 2 || -z "$2" ]]; then
@@ -170,6 +180,59 @@ configure_networks() {
     echo "[WARN] To use a specific upstream Wi-Fi, pass --wifi-ssid and --wifi-password or connect to it before running this script."
 }
 
+list_wireless_interfaces() {
+    iw dev 2>/dev/null | awk '$1 == "Interface" { print $2 }'
+}
+
+select_real_interface() {
+    local interfaces=()
+    local iface
+
+    if [[ -n "$REAL_IFACE" || "$COMMAND" != "start" ]]; then
+        return
+    fi
+
+    while IFS= read -r iface; do
+        interfaces+=("$iface")
+    done < <(list_wireless_interfaces)
+
+    if (( ${#interfaces[@]} > 0 )); then
+        echo "[*] Available Wi-Fi interfaces:"
+        printf '    %s\n' "${interfaces[@]}"
+    else
+        echo "[WARN] No Wi-Fi interfaces were detected automatically."
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "[ERROR] No --interface was provided and this shell is not interactive."
+        usage
+        exit 1
+    fi
+
+    while [[ -z "$REAL_IFACE" ]]; do
+        read -r -p "Wi-Fi interface to use for the hotspot: " REAL_IFACE
+        if [[ -z "$REAL_IFACE" ]]; then
+            echo "[ERROR] Interface name cannot be empty."
+        fi
+    done
+}
+
+validate_real_interface() {
+    if [[ -z "$REAL_IFACE" ]]; then
+        return
+    fi
+
+    if ! ip link show dev "$REAL_IFACE" >/dev/null 2>&1; then
+        echo "[ERROR] Interface '$REAL_IFACE' does not exist."
+        exit 1
+    fi
+
+    if ! iw dev "$REAL_IFACE" info >/dev/null 2>&1; then
+        echo "[ERROR] Interface '$REAL_IFACE' is not a Wi-Fi interface."
+        exit 1
+    fi
+}
+
 unblock_wifi() {
     if [[ ! -e /dev/rfkill ]]; then
         echo "[WARN] /dev/rfkill is not available; skipping rfkill unblock."
@@ -207,9 +270,11 @@ cleanup_hotspot() {
     pkill -F "$HOSTAPD_PID" 2>/dev/null || true
     pkill -F "$DNSMASQ_PID" 2>/dev/null || true
     rm -f "$HOSTAPD_PID" "$DNSMASQ_PID" "$HOSTAPD_CONF" "$DNSMASQ_CONF" "$DNSMASQ_LEASES"
-    iptables -t nat -D POSTROUTING -o "$REAL_IFACE" -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    if [[ -n "$REAL_IFACE" ]]; then
+        iptables -t nat -D POSTROUTING -o "$REAL_IFACE" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    fi
     iw dev "$AP_IFACE" del 2>/dev/null || true
     restore_ip_forward_state
 }
@@ -333,12 +398,14 @@ print_status() {
 
     if [[ "$overall_status" == "stopped" ]]; then
         internet_sharing="no"
-    elif iptables_has_rule -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE; then
+    elif [[ -n "$REAL_IFACE" ]] && iptables_has_rule -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE; then
         if [[ "$ip_forward" == "1" && "$upstream" != "none" ]]; then
             internet_sharing="yes, from $upstream"
         else
             internet_sharing="partial"
         fi
+    elif [[ -z "$REAL_IFACE" ]]; then
+        internet_sharing="unknown (use --interface to check NAT rules)"
     else
         case "$?" in
             2)
@@ -372,9 +439,15 @@ print_status() {
     echo "ip_forward: $ip_forward"
     echo "Upstream Wi-Fi: $upstream"
     echo "DHCP leases: $DNSMASQ_LEASES"
-    print_rule_status "NAT rule" -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
-    print_rule_status "Forward AP to upstream" -C FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
-    print_rule_status "Forward upstream to AP" -C FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    if [[ -n "$REAL_IFACE" ]]; then
+        print_rule_status "NAT rule" -t nat -C POSTROUTING -o "$REAL_IFACE" -j MASQUERADE
+        print_rule_status "Forward AP to upstream" -C FORWARD -i "$AP_IFACE" -o "$REAL_IFACE" -j ACCEPT
+        print_rule_status "Forward upstream to AP" -C FORWARD -i "$REAL_IFACE" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    else
+        echo "NAT rule: unknown (use --interface to check)"
+        echo "Forward AP to upstream: unknown (use --interface to check)"
+        echo "Forward upstream to AP: unknown (use --interface to check)"
+    fi
 
     if [[ -f "$IP_FORWARD_STATE" ]]; then
         echo "Saved ip_forward state: $(<"$IP_FORWARD_STATE")"
@@ -627,6 +700,8 @@ fi
 require_privileges "$@"
 print_hotspot_defaults_notice
 require_dependencies
+select_real_interface
+validate_real_interface
 
 if [[ "$COMMAND" == "stop" ]]; then
     cleanup_hotspot
