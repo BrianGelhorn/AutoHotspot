@@ -72,10 +72,18 @@ select_interface() {
   echo "$hotspot_interface"
 }
 
-cleanup_previous_start() {
+cleanup_hotspot() {
   nmcli_cmd connection down AutoHotspot >/dev/null 2>&1 || true
   nmcli_cmd connection delete AutoHotspot >/dev/null 2>&1 || true
   command -v "${AUTOHOTSPOT_IW:-iw}" >/dev/null 2>&1 && iw_cmd dev ap0 del >/dev/null 2>&1 || true
+}
+
+stop() {
+  [[ $# -eq 0 ]] || die "stop does not accept arguments yet"
+  command -v "${AUTOHOTSPOT_NMCLI:-nmcli}" >/dev/null 2>&1 || die "nmcli is required"
+
+  cleanup_hotspot
+  echo "AutoHotspot stopped"
 }
 
 start_ap() {
@@ -114,7 +122,7 @@ start() {
 
   command -v "${AUTOHOTSPOT_NMCLI:-nmcli}" >/dev/null 2>&1 || die "nmcli is required"
 
-  cleanup_previous_start
+  cleanup_hotspot
   hotspot_interface=$(select_interface "$hotspot_interface")
 
   if [[ -z $ssid || -z $password ]]; then
@@ -147,7 +155,10 @@ main() {
     start)
       require_root "$@"
       shift; start "$@" ;;
-    stop|restart|status|doctor)
+    stop)
+      require_root "$@"
+      shift; stop "$@" ;;
+    restart|status|doctor)
       no_args "$@" ;;
     --help|-h|help)
       usage ;;
